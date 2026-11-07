@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Recording active">
+  <defs>
+    <radialGradient id="button" cx="38%" cy="30%" r="72%">
+      <stop offset="0" stop-color="#ff5b62"/>
+      <stop offset="0.55" stop-color="#e3262e"/>
+      <stop offset="1" stop-color="#a90e18"/>
+    </radialGradient>
+    <filter id="redGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <style>
+      .wave { fill:none; stroke:#ef4444; stroke-width:5; opacity:0; transform-box:fill-box; transform-origin:center; animation:wave 2.2s ease-out infinite; }
+      .wave.two { animation-delay:.73s; }
+      .wave.three { animation-delay:1.46s; }
+      .pulse { fill:none; stroke:#ef4444; stroke-width:4; opacity:0; transform-box:fill-box; transform-origin:center; animation:pulse 1.5s ease-out infinite; }
+      .dot { transform-box:fill-box; transform-origin:center; animation:dot 1.5s ease-in-out infinite; }
+      @keyframes wave { 0% { opacity:.8; transform:scale(.44); } 62% { opacity:.28; } 100% { opacity:0; transform:scale(1.75); } }
+      @keyframes pulse { 0%,100% { opacity:0; transform:scale(.86); } 35% { opacity:.7; } 70% { opacity:0; transform:scale(1.22); } }
+      @keyframes dot { 0%,100% { transform:scale(.94); } 50% { transform:scale(1.08); } }
+      @media (prefers-reduced-motion:reduce) { .wave,.pulse,.dot { animation-play-state:paused; } }
+    </style>
+  </defs>
+
+  <!-- Quiet, shaded outer border -->
+  <circle cx="128" cy="128" r="91" fill="#0f172a" stroke="#334155" stroke-width="7"/>
+  <circle cx="128" cy="128" r="82" fill="none" stroke="#1e293b" stroke-width="2"/>
+
+  <!-- Waves leave the recording button -->
+  <circle class="wave" cx="128" cy="128" r="48"/>
+  <circle class="wave two" cx="128" cy="128" r="48"/>
+  <circle class="wave three" cx="128" cy="128" r="48"/>
+
+  <!-- Pulse originates from the button itself -->
+  <circle class="pulse" cx="128" cy="128" r="48"/>
+  <circle cx="128" cy="128" r="45" fill="#111827" stroke="#475569" stroke-width="3"/>
+  <circle class="dot" cx="128" cy="128" r="31" fill="url(#button)" filter="url(#redGlow)"/>
+  <circle cx="119" cy="117" r="9" fill="#ffb0b3" opacity=".28"/>
+</svg>
