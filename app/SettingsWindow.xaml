@@ -41,6 +41,39 @@
       </Setter>
     </Style>
 
+    <!-- Round radio button with an accent dot -->
+    <Style x:Key="Radio" TargetType="RadioButton">
+      <Setter Property="Margin" Value="0,0,0,8"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <StackPanel Orientation="Horizontal" Background="Transparent">
+              <Grid Width="18" Height="18" VerticalAlignment="Center">
+                <Ellipse x:Name="Ring" Stroke="#9AA4B2" StrokeThickness="1.5" Fill="White"/>
+                <Ellipse x:Name="Dot" Width="8" Height="8" Fill="White" Visibility="Collapsed"/>
+              </Grid>
+              <ContentPresenter Margin="10,0,0,0" VerticalAlignment="Center"/>
+            </StackPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Ring" Property="Stroke" Value="{StaticResource Accent}"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Ring" Property="Fill" Value="{StaticResource Accent}"/>
+                <Setter TargetName="Ring" Property="Stroke" Value="{StaticResource Accent}"/>
+                <Setter TargetName="Dot" Property="Visibility" Value="Visible"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <!-- Rounded text field -->
     <Style x:Key="Field" TargetType="TextBox">
       <Setter Property="Height" Value="34"/>
@@ -127,6 +160,16 @@
 
     <CheckBox x:Name="OpenAfterBox" Content="Open audio file after saving"/>
     <CheckBox x:Name="TranscriptBox" Content="Live transcript"/>
+    <StackPanel Margin="28,0,0,8" IsEnabled="{Binding IsChecked, ElementName=TranscriptBox}">
+      <RadioButton x:Name="EngineCaptions" GroupName="Engine" Style="{StaticResource Radio}">
+        <TextBlock TextWrapping="Wrap"><Run Text="Windows Live Captions"/><Run Text="  instant, built into Windows" Foreground="{StaticResource Muted}" FontSize="12"/></TextBlock>
+      </RadioButton>
+      <CheckBox x:Name="HideLcBox" Content="Hide the Live Captions window while recording" Margin="28,0,0,8"
+                IsEnabled="{Binding IsChecked, ElementName=EngineCaptions}"/>
+      <RadioButton x:Name="EngineWhisper" GroupName="Engine" Style="{StaticResource Radio}">
+        <TextBlock TextWrapping="Wrap"><Run Text="Whisper on this PC's GPU"/><Run Text="  slower, needs the Python setup" Foreground="{StaticResource Muted}" FontSize="12"/></TextBlock>
+      </RadioButton>
+    </StackPanel>
     <CheckBox x:Name="MicBox" Content="Record my microphone (applies from the next recording)" Margin="0,0,0,18"/>
 
     <TextBlock Text="Show / hide shortcut" Style="{StaticResource Heading}"/>

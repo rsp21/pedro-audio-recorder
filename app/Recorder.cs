@@ -24,23 +24,28 @@ internal sealed class Recorder
     private readonly Stopwatch _clock = new();
 
     private static string Dir => AppContext.BaseDirectory;
+    private static readonly object CoreLogLock = new();
     private static readonly string Id = Environment.ProcessId.ToString();
 
     public TimeSpan Elapsed => _clock.Elapsed;
 
-    /// <summary>Peak level (0..1) of PC audio and microphone, written by the core.</summary>
-    public float Level
+    /// <summary>Short-term RMS (0..1) of PC audio and microphone, written by the core every ~10 ms.</summary>
+    public (float pc, float mic) Levels
     {
         get
         {
-            if (_levels == null) return 0;
-            try { return Math.Max(_levels.ReadSingle(0), _levels.ReadSingle(4)); }
-            catch (ObjectDisposedException) { return 0; }
+            var l = _levels;
+            if (l == null) return (0, 0);
+            try { return (l.ReadSingle(0), l.ReadSingle(4)); }
+            catch (ObjectDisposedException) { return (0, 0); }
         }
     }
 
+    public float Level { get { var (pc, mic) = Levels; return Math.Max(pc, mic); } }
+
     /// <summary>Starts a recording. Returns an error message, or null.</summary>
-    public string? Start(string fileName, bool recordMic, bool transcribe)
+    /// <param name="whisper">Run the Whisper worker (otherwise the app transcribes with Live Captions).</param>
+    public string? Start(string fileName, bool recordMic, bool whisper)
     {
         if (_core != null) return null;
         var folder = AppSettings.OutputFolder;
@@ -70,10 +75,24 @@ internal sealed class Recorder
 
         var core = Path.Combine(Dir, "pedro-audio-recorder-core.exe");
         var args = $"\"{output}\" --stop-event \"{stopName}\" --pause-event \"{pauseName}\" --control-id \"{Id}\"" +
-                   (recordMic ? "" : " --no-mic");
+                   (recordMic ? "" : " --no-mic") + (whisper ? "" : " --no-sources");
         try
         {
-            _core = Process.Start(new ProcessStartInfo(core, args) { UseShellExecute = false, CreateNoWindow = true });
+            var psi = new ProcessStartInfo(core, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true };
+            _core = Process.Start(psi);
+            if (_core != null)
+            {
+                // The core reports device and file problems on stderr: keep them for diagnosis.
+                var log = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RSP-Audio-Recorder", "core.log");
+                Directory.CreateDirectory(Path.GetDirectoryName(log)!);
+                _core.ErrorDataReceived += (_, e) =>
+                {
+                    if (e.Data == null) return;
+                    try { lock (CoreLogLock) File.AppendAllText(log, $"{DateTime.Now:HH:mm:ss} {e.Data}{Environment.NewLine}"); } catch (IOException) { }
+                };
+                _core.BeginErrorReadLine();
+                MainWindow.Log($"recording started: {output} (mic={recordMic}, whisper={whisper}) core pid={_core.Id}");
+            }
         }
         catch (Exception ex)
         {
@@ -84,7 +103,7 @@ internal sealed class Recorder
         Output = output;
         State = RecState.Recording;
         _clock.Restart();
-        TranscriberRunning = transcribe && StartTranscriber(output, stopName);
+        TranscriberRunning = whisper && StartTranscriber(output, stopName);
         return null;
     }
 
@@ -117,6 +136,7 @@ internal sealed class Recorder
         });
         var saved = Output;
         LastSaved = saved;
+        MainWindow.Log($"recording stopped by user: {saved} exit={(core.HasExited ? core.ExitCode : -1)}");
         Cleanup();
         return saved;
     }
@@ -136,6 +156,7 @@ internal sealed class Recorder
         code = 0;
         if (_core == null || !_core.HasExited) return false;
         code = _core.ExitCode;
+        MainWindow.Log($"recording ended by itself: {Output} exit={code}");
         LastSaved = code == 0 ? Output : LastSaved;
         Cleanup();
         return true;

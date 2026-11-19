@@ -24,6 +24,7 @@ public partial class MainWindow : Window
     private const double CompactWidth = 580, CompactHeight = 262;
 
     private readonly Recorder _recorder = new();
+    private LiveCaptionsEngine? _captions;
     private readonly ObservableCollection<Session> _sessions = new();
     private readonly Dictionary<string, Session> _byPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly ListCollectionView _view;
@@ -178,13 +179,38 @@ public partial class MainWindow : Window
     {
         if (_quitting) return;
         _quitting = true;
-        _recorder.StopNow();
+        SaveAndStop();
         Native.UnregisterHotkey(_hwnd, HotkeyId);
         Close();
         Application.Current.Shutdown();
     }
 
-    public void SaveAndStop() => _recorder.StopNow();
+    public void SaveAndStop()
+    {
+        _captions?.Stop();
+        _captions = null;
+        _recorder.StopNow();
+    }
+
+    private async Task StopCaptionsAsync()
+    {
+        var c = _captions;
+        _captions = null;
+        if (c != null) await Task.Run(c.Stop);
+    }
+
+    /// <summary>Live Captions produced new text: show it now rather than on the next poll.</summary>
+    private void OnCaptionsChanged()
+    {
+        if (!_expanded || !IsVisible) return;
+        var stem = _captions?.Stem;
+        if (stem != null && (_current == null || !_current.Stem.Equals(stem, StringComparison.OrdinalIgnoreCase)))
+        {
+            Rescan();
+            return;
+        }
+        if (_current != null && _current.Refresh()) Render(full: false);
+    }
 
     private void Min_Click(object sender, RoutedEventArgs e) => Hide();
     private void Close_Click(object sender, RoutedEventArgs e) => Hide();
@@ -252,16 +278,28 @@ public partial class MainWindow : Window
     {
         if (_recorder.State == Recorder.RecState.Idle)
         {
-            var error = _recorder.Start(AppSettings.FileName, AppSettings.RecordMic, AppSettings.LiveTranscript);
+            bool transcribe = AppSettings.LiveTranscript;
+            bool whisper = transcribe && AppSettings.Engine == AppSettings.EngineWhisper;
+            bool startedLc = false;
+            bool captions = transcribe && !whisper && LiveCaptionsEngine.EnsureRunning(out startedLc);
+            var error = _recorder.Start(AppSettings.FileName, AppSettings.RecordMic, whisper);
             if (error != null) { SetMessage(error, LiveBrush); return; }
-            SetMessage(AppSettings.LiveTranscript && !_recorder.TranscriberRunning
-                ? "Recording (transcript unavailable)" : "Recording", LiveBrush);
+            if (captions)
+            {
+                _captions = new LiveCaptionsEngine(_recorder, _recorder.Output!, AppSettings.RecordMic,
+                                                   AppSettings.HideLiveCaptions, startedLc);
+                _captions.Changed += () => Dispatcher.BeginInvoke(OnCaptionsChanged, DispatcherPriority.Send);
+            }
+            bool unavailable = transcribe && (whisper ? !_recorder.TranscriberRunning : !captions);
+            SetMessage(unavailable ? "Recording (transcript unavailable)" : "Recording", LiveBrush);
             _follow = true;
             Rescan();
         }
         else
         {
             _recorder.TogglePause();
+            if (_recorder.State == Recorder.RecState.Paused) _captions?.Pause();
+            else _captions?.Resume();
             SetMessage(_recorder.State == Recorder.RecState.Paused ? "Paused" : "Recording",
                        _recorder.State == Recorder.RecState.Paused ? PausedBrush : LiveBrush);
         }
@@ -273,6 +311,7 @@ public partial class MainWindow : Window
         if (_recorder.State == Recorder.RecState.Idle) return;
         StopButton.IsEnabled = false;
         SetMessage("Saving…", PausedBrush);
+        await StopCaptionsAsync();
         var saved = await _recorder.StopAsync();
         if (saved != null)
         {
@@ -336,6 +375,7 @@ public partial class MainWindow : Window
     {
         if (_recorder.ExitedUnexpectedly(out int code))
         {
+            _ = StopCaptionsAsync();
             if (code == 0) SetMessage("Saved  ·  " + Path.GetFileName(_recorder.LastSaved), SavedBrush);
             else SetMessage("Recording stopped unexpectedly", LiveBrush);
         }
@@ -381,6 +421,7 @@ public partial class MainWindow : Window
     {
         if (_current == null || !_expanded || !IsVisible) return;
         if (_current.Done && !_current.IsLive && _partials.Count == 0) return;
+        if (_captions != null && _current.Stem.Equals(_captions.Stem, StringComparison.OrdinalIgnoreCase)) return;  // pushed instead
         if (_current.Refresh()) Render(full: false);
     }
 
@@ -552,10 +593,13 @@ public partial class MainWindow : Window
     /// <summary>The words still being worked out, in grey: one live line per source.</summary>
     private void AddPartials(Session s)
     {
-        foreach (var (key, text) in s.Partials.OrderBy(p => p.Key == Sources.Pc ? 0 : 1))
+        var pieces = s.Parts.Count > 0
+            ? s.Parts
+            : s.Partials.OrderBy(p => p.Key == Sources.Pc ? 0 : 1)
+                        .Select(p => ((string?)(p.Key is Sources.Mic or Sources.Pc ? p.Key : null), p.Value)).ToList();
+        foreach (var (source, text) in pieces)
         {
             if (text.Length == 0) continue;
-            string? source = key is Sources.Mic or Sources.Pc ? key : null;
             if (_rendered == 0 && _lastPara == null && _partials.Count == 0) Doc.Document.Blocks.Clear();
             var run = new Run(text) { Foreground = MutedBrush };
             if (_lastPara != null && _lastParaSource == source && s.Duration - _lastParaEnd < 6)

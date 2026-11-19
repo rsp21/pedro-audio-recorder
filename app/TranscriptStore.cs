@@ -43,6 +43,8 @@ public sealed class Session : INotifyPropertyChanged
     public string LiveStatus { get; private set; } = "";
     public string LiveMessage { get; private set; } = "";
     public Dictionary<string, string> Partials { get; private set; } = new();
+    /// <summary>The live text in order, as (source, text) pieces (Live Captions engine).</summary>
+    public List<(string? Source, string Text)> Parts { get; private set; } = new();
     private double _position;
     private double _finalDuration;
     private long _offset;
@@ -172,6 +174,7 @@ public sealed class Session : INotifyPropertyChanged
         bool live = false;
         string status = "", message = "";
         var partials = new Dictionary<string, string>();
+        var parts = new List<(string? Source, string Text)>();
         if (!Done && File.Exists(LivePath))
         {
             try
@@ -186,6 +189,10 @@ public sealed class Session : INotifyPropertyChanged
                         partials[p.Name] = p.Value.GetString() ?? "";
                 else if (r.TryGetProperty("partial", out var single))
                     partials["mixed"] = single.GetString() ?? "";
+                if (r.TryGetProperty("parts", out var pa) && pa.ValueKind == JsonValueKind.Array)
+                    foreach (var p in pa.EnumerateArray())
+                        parts.Add((p.TryGetProperty("source", out var ps2) && ps2.ValueKind == JsonValueKind.String ? ps2.GetString() : null,
+                                   p.GetProperty("text").GetString() ?? ""));
                 _position = r.GetProperty("position").GetDouble();
                 double updated = r.GetProperty("updated").GetDouble();
                 // A worker that stopped updating (crashed) is no longer live.
@@ -197,13 +204,15 @@ public sealed class Session : INotifyPropertyChanged
             catch (KeyNotFoundException) { return false; }
             catch (InvalidOperationException) { return false; }
         }
-        if (!live) partials.Clear();
+        if (!live) { partials.Clear(); parts.Clear(); }
         bool changed = live != IsLive || status != LiveStatus || message != LiveMessage
-                       || !partials.OrderBy(k => k.Key).SequenceEqual(Partials.OrderBy(k => k.Key));
+                       || !partials.OrderBy(k => k.Key).SequenceEqual(Partials.OrderBy(k => k.Key))
+                       || !parts.SequenceEqual(Parts);
         IsLive = live;
         LiveStatus = status;
         LiveMessage = message;
         Partials = partials;
+        Parts = parts;
         return changed;
     }
 

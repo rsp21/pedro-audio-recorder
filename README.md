@@ -38,11 +38,20 @@ The final executable targets Windows 11 x64 and will be built with the Visual St
 
 Build everything with `build_gui.bat`. It builds the C++ capture core, copies the transcription worker, and builds the WPF app (`app/`, .NET 9) into `build\`.
 
-## Recording and live transcript
+## Live transcript: Windows Live Captions (default)
+
+The transcript comes from **Windows 11 Live Captions**, the same on-device speech engine and the same text, with the same speed. Windows has no public API for that engine, so the app starts `LiveCaptions.exe` when needed and reads its caption text through UI Automation (the `CaptionsTextBlock` element) every 50 ms. No extra model, Python or internet connection is involved.
+
+- Each paragraph Live Captions finishes is saved to the transcript. The paragraph in progress is shown live as it changes.
+- **Microphone vs PC audio:** Live Captions mixes both sources. The recorder core publishes the level of each source every 10 ms, and each sentence gets the label of the source that was louder while its words appeared. This needs **Settings → Record my microphone** in this app. For your own voice to be captioned at all, also turn on **Include microphone audio** in Live Captions' own settings (gear icon → Preferences).
+- Captions follow the Live Captions language (`HKCU\Software\Microsoft\LiveCaptions\UI`, value `CaptionLanguage`).
+- Under **Settings → Live transcript** you can switch to **Whisper on this PC's GPU** instead. It is slower, but it labels each source exactly from its own audio channel (see below).
+
+## Recording and Whisper transcript
 
 Each recording mixes the system audio (WASAPI loopback) with your microphone (the Poly BT700 headset mic when it is connected, otherwise the default recording device) into `<name>.wav`. The output is timed by the clock, so silence is kept at its real length. Turn the microphone off under **Settings → Record my microphone**. On the command line, the core takes `--no-mic`.
 
-The core also writes `<name>.sources.wav` while recording: 16 kHz, with PC audio on the left channel and the microphone on the right. `live_transcriber.py` transcribes each channel separately with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (large-v3 on the GPU, small on the CPU). Every line in the transcript is labelled **Microphone** or **PC audio**. Text appears about 1–2 seconds behind the audio. The sources file is deleted once the transcript is finished.
+With the Whisper engine, the core also writes `<name>.sources.wav` while recording: 16 kHz, with PC audio on the left channel and the microphone on the right. `live_transcriber.py` transcribes each channel separately with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (large-v3 on the GPU, small on the CPU). Every line in the transcript is labelled **Microphone** or **PC audio**. Text appears about 1–2 seconds behind the audio. The sources file is deleted once the transcript is finished.
 
 - **Python:** uses `%USERPROFILE%\RSP-Transcript\.venv` (faster-whisper with CUDA, created by that project's `setup.ps1`). To use a different interpreter, set the `RSP_PYTHON` environment variable or the `PythonPath` value under `HKCU\Software\RSP\AudioRecorder`.
 - **Files:** each recording gets `<name>.transcript.jsonl` (the saved transcript, one line per segment, with its source) next to its `.wav` in `Music\Audio Recorder`. While it is recording there is also a temporary `<name>.live.json`. The format is described at the top of `transcriber/live_transcriber.py`.

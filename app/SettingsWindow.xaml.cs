@@ -27,6 +27,9 @@ public partial class SettingsWindow : Window
         OpenAfterBox.IsChecked = AppSettings.OpenAfterSave;
         TranscriptBox.IsChecked = AppSettings.LiveTranscript;
         MicBox.IsChecked = AppSettings.RecordMic;
+        EngineCaptions.IsChecked = AppSettings.Engine == AppSettings.EngineLiveCaptions;
+        EngineWhisper.IsChecked = !EngineCaptions.IsChecked;
+        HideLcBox.IsChecked = AppSettings.HideLiveCaptions;
         StartupBox.IsChecked = AppSettings.StartWithWindows;
         _hotkey = AppSettings.Hotkey;
         HotkeyBox.Text = Native.HotkeyText(_hotkey);
@@ -78,6 +81,8 @@ public partial class SettingsWindow : Window
         AppSettings.OpenAfterSave = OpenAfterBox.IsChecked == true;
         AppSettings.LiveTranscript = TranscriptBox.IsChecked == true;
         AppSettings.RecordMic = MicBox.IsChecked == true;
+        AppSettings.HideLiveCaptions = HideLcBox.IsChecked == true;
+        AppSettings.Engine = EngineWhisper.IsChecked == true ? AppSettings.EngineWhisper : AppSettings.EngineLiveCaptions;
         AppSettings.StartWithWindows = StartupBox.IsChecked == true;
         DialogResult = true;
     }

@@ -400,6 +400,9 @@ int main(int argc, char** argv) {
     bool use_mic = true;
     for (int i = 1; i < argc; ++i)
         if (std::string(argv[i]) == "--no-mic") use_mic = false;
+    bool want_sources = true;  // <name>.sources.wav is only needed by the Whisper transcriber
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--no-sources") want_sources = false;
     HANDLE stop_event = stop_event_name.empty() ? nullptr : OpenEventA(SYNCHRONIZE, FALSE, stop_event_name.c_str());
     HANDLE pause_event = pause_event_name.empty() ? nullptr : OpenEventA(SYNCHRONIZE, FALSE, pause_event_name.c_str());
     HANDLE control_mapping = control_id.empty() ? nullptr : OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, ("Local\\RSPAudioLevels_" + control_id).c_str());
@@ -425,14 +428,14 @@ int main(int argc, char** argv) {
     const std::string stem = output.size() > 4 && _stricmp(output.c_str() + output.size() - 4, ".wav") == 0
                                  ? output.substr(0, output.size() - 4) : output;
     WavWriter sources;
-    const bool write_sources = sources.open(stem + ".sources.wav", kSourcesRate);
-    if (!write_sources) std::cerr << "sources file could not be opened; continuing without it\n";
+    const bool write_sources = want_sources && sources.open(stem + ".sources.wav", kSourcesRate);
+    if (want_sources && !write_sources) std::cerr << "sources file could not be opened; continuing without it\n";
     Decimate3 render_down, mic_down;
     std::vector<float> render_16k, mic_16k, sources_block;
 
     SampleQueue render_queue;
     std::atomic<bool> running{true};
-    CaptureArgs render_args{render_client, render_format, &render_queue, &running, true, "loopback", levels ? &levels[0] : nullptr};
+    CaptureArgs render_args{render_client, render_format, &render_queue, &running, true, "loopback", nullptr};
     std::cerr << "starting loopback thread\n";
     std::thread render_thread(capture_thread, render_args);
 
@@ -448,7 +451,7 @@ int main(int argc, char** argv) {
                                                reinterpret_cast<void**>(mic_client.GetAddressOf()))) &&
             SUCCEEDED(hr = mic_client->GetMixFormat(&mic_format)) && inspect_format("microphone", mic_format)) {
             std::wcout << L"Microphone: " << endpoint_name(mic.Get()) << L"\n";
-            CaptureArgs mic_args{mic_client, mic_format, &mic_queue, &running, false, "microphone", levels ? &levels[1] : nullptr};
+            CaptureArgs mic_args{mic_client, mic_format, &mic_queue, &running, false, "microphone", nullptr};
             mic_thread = std::thread(capture_thread, mic_args);
         } else {
             log_hr("microphone unavailable; recording system audio only", hr);
@@ -481,6 +484,7 @@ int main(int argc, char** argv) {
             if (!paused) { paused = true; pause_began = now; }
             render_queue.clear();  // audio captured while paused is discarded
             mic_queue.clear();
+            if (levels) levels[0] = levels[1] = 0.0f;
             std::this_thread::sleep_for(30ms);
             continue;
         }
@@ -512,6 +516,18 @@ int main(int argc, char** argv) {
         }
         if (!wav.write_pcm16(pedro_audio::float_to_pcm16(stereo))) { std::cerr << "WAV write failed\n"; break; }
         output_frames += n;
+        // Shared levels for the app: [0] = PC audio, [1] = microphone. Short-term RMS of
+        // exactly what is being written, so silence reads as silence. The app uses them
+        // for the record-button glow and to tell who is speaking.
+        if (levels) {
+            auto rms = [](const std::vector<float>& b) {
+                double acc = 0.0;
+                for (float v : b) acc += static_cast<double>(v) * v;
+                return b.empty() ? 0.0f : static_cast<float>(std::sqrt(acc / static_cast<double>(b.size())));
+            };
+            levels[0] = 0.5f * levels[0] + 0.5f * rms(render_block);
+            levels[1] = 0.5f * levels[1] + 0.5f * rms(mic_block);
+        }
         std::this_thread::sleep_for(10ms);
     }
 
