@@ -50,16 +50,105 @@ public:
         cv_.notify_all();
     }
 
-    bool pop(float& value, const std::atomic<bool>& running) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (!cv_.wait_for(lock, 100ms, [&] { return !samples_.empty() || !running.load(); })) return false;
-        if (samples_.empty()) return false;
-        value = samples_.front();
-        samples_.pop_front();
-        return true;
+    // Copies up to n samples into dst; returns how many were available.
+    size_t take(float* dst, size_t n) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const size_t count = std::min(n, samples_.size());
+        std::copy_n(samples_.begin(), count, dst);
+        samples_.erase(samples_.begin(), samples_.begin() + static_cast<std::ptrdiff_t>(count));
+        return count;
+    }
+
+    // Drops the oldest samples so at most `keep` remain (clock-drift guard).
+    void trim_to(size_t keep) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (samples_.size() > keep)
+            samples_.erase(samples_.begin(), samples_.begin() + static_cast<std::ptrdiff_t>(samples_.size() - keep));
+    }
+
+    size_t size() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return samples_.size();
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        samples_.clear();
     }
 
     void wake() { cv_.notify_all(); }
+};
+
+// Streaming linear-interpolation resampler (device rate -> 48 kHz output rate).
+class LinearResampler {
+    double step_;
+    double pos_ = 0.0;
+    float last_ = 0.0f;
+    bool primed_ = false;
+public:
+    LinearResampler(uint32_t in_rate, uint32_t out_rate)
+        : step_(static_cast<double>(in_rate) / static_cast<double>(out_rate)) {}
+
+    std::vector<float> process(const std::vector<float>& input) {
+        if (std::abs(step_ - 1.0) < 1e-9 || input.empty()) return input;
+        // Virtual signal: [last sample of previous block] + input.
+        std::vector<float> buf;
+        buf.reserve(input.size() + 1);
+        buf.push_back(primed_ ? last_ : input.front());
+        buf.insert(buf.end(), input.begin(), input.end());
+        std::vector<float> out;
+        out.reserve(static_cast<size_t>(input.size() / step_) + 2);
+        while (pos_ + 1.0 < static_cast<double>(buf.size())) {
+            const size_t i = static_cast<size_t>(pos_);
+            const float f = static_cast<float>(pos_ - static_cast<double>(i));
+            out.push_back(buf[i] * (1.0f - f) + buf[i + 1] * f);
+            pos_ += step_;
+        }
+        pos_ -= static_cast<double>(buf.size() - 1);
+        last_ = buf.back();
+        primed_ = true;
+        return out;
+    }
+};
+
+constexpr uint32_t kOutputRate = 48000;
+constexpr uint32_t kSourcesRate = 16000;  // speech-recognition rate for <name>.sources.wav
+
+// 48 kHz -> 16 kHz: windowed-sinc low-pass, then keep every third sample.
+// Stateful, so consecutive blocks join seamlessly.
+class Decimate3 {
+    std::vector<float> taps_;
+    std::vector<float> history_;
+    size_t phase_ = 0;
+public:
+    Decimate3() {
+        const int half = 24;
+        const double cutoff = 0.45 / 3.0;  // of the 48 kHz sample rate (~7.2 kHz)
+        double sum = 0.0;
+        for (int n = -half; n <= half; ++n) {
+            const double x = 2.0 * cutoff * n;
+            const double sinc = n == 0 ? 1.0 : std::sin(3.14159265358979 * x) / (3.14159265358979 * x);
+            const double window = 0.54 + 0.46 * std::cos(3.14159265358979 * n / half);
+            taps_.push_back(static_cast<float>(2.0 * cutoff * sinc * window));
+            sum += taps_.back();
+        }
+        for (auto& t : taps_) t = static_cast<float>(t / sum);
+        history_.assign(taps_.size() - 1, 0.0f);
+    }
+
+    void process(const std::vector<float>& in, std::vector<float>& out) {
+        out.clear();
+        std::vector<float> x(history_);
+        x.insert(x.end(), in.begin(), in.end());
+        const size_t valid = x.size() - taps_.size() + 1;
+        for (size_t i = phase_; i < valid; i += 3) {
+            float acc = 0.0f;
+            for (size_t k = 0; k < taps_.size(); ++k) acc += x[i + k] * taps_[k];
+            out.push_back(acc);
+        }
+        phase_ = (phase_ + 3 - valid % 3) % 3;
+        history_.assign(x.end() - static_cast<std::ptrdiff_t>(taps_.size() - 1), x.end());
+    }
 };
 
 class WavWriter {
@@ -210,6 +299,7 @@ void capture_thread(CaptureArgs args) {
               << " bits=" << args.format->wBitsPerSample << "\n";
 
     const bool is_float = format_is_float(args.format);
+    LinearResampler resampler(args.format->nSamplesPerSec, kOutputRate);
     const size_t bytes_per_sample = args.format->nBlockAlign / args.format->nChannels;
     uint64_t frames_seen = 0;
     while (args.running->load()) {
@@ -238,7 +328,7 @@ void capture_thread(CaptureArgs args) {
                     mono[frame] = std::clamp(sum / static_cast<float>(args.format->nChannels), -1.0f, 1.0f);
                 }
             }
-            args.queue->push(mono);
+            args.queue->push(resampler.process(mono));
             if (args.level) {
                 float peak = 0.0f;
                 for (float sample : mono) peak = std::max(peak, std::abs(sample));
@@ -307,6 +397,12 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "--pause-event") pause_event_name = argv[i + 1];
         if (std::string(argv[i]) == "--control-id") control_id = argv[i + 1];
     }
+    bool use_mic = true;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--no-mic") use_mic = false;
+    bool want_sources = true;  // <name>.sources.wav is only needed by the Whisper transcriber
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--no-sources") want_sources = false;
     HANDLE stop_event = stop_event_name.empty() ? nullptr : OpenEventA(SYNCHRONIZE, FALSE, stop_event_name.c_str());
     HANDLE pause_event = pause_event_name.empty() ? nullptr : OpenEventA(SYNCHRONIZE, FALSE, pause_event_name.c_str());
     HANDLE control_mapping = control_id.empty() ? nullptr : OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, ("Local\\RSPAudioLevels_" + control_id).c_str());
@@ -326,46 +422,123 @@ int main(int argc, char** argv) {
     if (!inspect_format("render", render_format)) return 6;
 
     WavWriter wav;
-    if (!wav.open(output, 48000)) { std::cerr << "Cannot open output\n"; CoTaskMemFree(render_format); return 2; }
+    if (!wav.open(output, kOutputRate)) { std::cerr << "Cannot open output\n"; CoTaskMemFree(render_format); return 2; }
+    // Side file for the live transcript: left = PC audio, right = microphone, 16 kHz.
+    // Lets the transcriber label who said what without separating a mixed signal.
+    const std::string stem = output.size() > 4 && _stricmp(output.c_str() + output.size() - 4, ".wav") == 0
+                                 ? output.substr(0, output.size() - 4) : output;
+    WavWriter sources;
+    const bool write_sources = want_sources && sources.open(stem + ".sources.wav", kSourcesRate);
+    if (want_sources && !write_sources) std::cerr << "sources file could not be opened; continuing without it\n";
+    Decimate3 render_down, mic_down;
+    std::vector<float> render_16k, mic_16k, sources_block;
 
     SampleQueue render_queue;
     std::atomic<bool> running{true};
-    CaptureArgs render_args{render_client, render_format, &render_queue, &running, true, "loopback", levels ? &levels[0] : nullptr};
-    const uint32_t render_rate = render_format->nSamplesPerSec;
+    CaptureArgs render_args{render_client, render_format, &render_queue, &running, true, "loopback", nullptr};
     std::cerr << "starting loopback thread\n";
     std::thread render_thread(capture_thread, render_args);
-    std::cerr << "capture thread launched\n";
+
+    // Microphone (Poly BT700 when present, else the default recording device).
+    // Optional: if it cannot be opened the recording continues with system audio only.
+    SampleQueue mic_queue;
+    std::thread mic_thread;
+    if (use_mic) {
+        ComPtr<IMMDevice> mic = find_endpoint(enumerator.Get(), eCapture, L"Poly BT700");
+        ComPtr<IAudioClient> mic_client;
+        WAVEFORMATEX* mic_format = nullptr;
+        if (mic && SUCCEEDED(hr = mic->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                               reinterpret_cast<void**>(mic_client.GetAddressOf()))) &&
+            SUCCEEDED(hr = mic_client->GetMixFormat(&mic_format)) && inspect_format("microphone", mic_format)) {
+            std::wcout << L"Microphone: " << endpoint_name(mic.Get()) << L"\n";
+            CaptureArgs mic_args{mic_client, mic_format, &mic_queue, &running, false, "microphone", nullptr};
+            mic_thread = std::thread(capture_thread, mic_args);
+        } else {
+            log_hr("microphone unavailable; recording system audio only", hr);
+            if (mic_format) CoTaskMemFree(mic_format);
+        }
+    }
 
     std::atomic<bool> stop_input{false};
     std::thread input_thread;
     if (seconds == 0 && !stop_event) input_thread = std::thread([&] { std::string ignored; std::getline(std::cin, ignored); stop_input = true; });
     const auto deadline = seconds > 0 ? std::chrono::steady_clock::now() + std::chrono::seconds(seconds) : std::chrono::steady_clock::time_point::max();
 
-    double render_accumulator = 0.0;
-    float last_render = 0.0f;
+    // The wall clock (minus pauses) decides how much audio to write, so the file keeps
+    // time even when a source delivers nothing (loopback sends no packets while
+    // nothing is playing). Each source is a 48 kHz mono queue; a short latency
+    // absorbs packet jitter, missing samples are silence, and a queue that runs
+    // ahead (device clock drift) is trimmed.
+    const uint64_t latency = kOutputRate * 120 / 1000;
+    const size_t max_backlog = kOutputRate * 400 / 1000;
+    const auto started = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration paused_total{};
+    std::chrono::steady_clock::time_point pause_began{};
+    bool paused = false;
     uint64_t output_frames = 0;
+    std::vector<float> render_block, mic_block, stereo;
     while (std::chrono::steady_clock::now() < deadline && !stop_input.load()) {
         if (stop_event && WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) break;
+        const auto now = std::chrono::steady_clock::now();
         if (pause_event && WaitForSingleObject(pause_event, 0) == WAIT_OBJECT_0) {
-            std::this_thread::sleep_for(50ms);
+            if (!paused) { paused = true; pause_began = now; }
+            render_queue.clear();  // audio captured while paused is discarded
+            mic_queue.clear();
+            if (levels) levels[0] = levels[1] = 0.0f;
+            std::this_thread::sleep_for(30ms);
             continue;
         }
-        render_accumulator += static_cast<double>(render_rate);
-        while (render_accumulator >= 48000.0) {
-            float sample = 0.0f;
-            if (render_queue.pop(sample, running)) last_render = sample;
-            render_accumulator -= 48000.0;
+        if (paused) { paused = false; paused_total += now - pause_began; }
+
+        const double active = std::chrono::duration<double>(now - started - paused_total).count();
+        const int64_t target = static_cast<int64_t>(active * kOutputRate) - static_cast<int64_t>(latency);
+        if (target <= static_cast<int64_t>(output_frames)) { std::this_thread::sleep_for(10ms); continue; }
+        const size_t n = static_cast<size_t>(target - static_cast<int64_t>(output_frames));
+
+        for (SampleQueue* q : {&render_queue, &mic_queue})
+            if (q->size() > n + max_backlog) q->trim_to(n + latency);
+        render_block.assign(n, 0.0f);
+        mic_block.assign(n, 0.0f);
+        render_queue.take(render_block.data(), n);
+        mic_queue.take(mic_block.data(), n);
+        stereo.assign(n * 2, 0.0f);
+        pedro_audio::mix_to_stereo(render_block, 1, mic_block, 1, stereo);
+        if (write_sources) {
+            render_down.process(render_block, render_16k);
+            mic_down.process(mic_block, mic_16k);
+            const size_t m = std::min(render_16k.size(), mic_16k.size());
+            sources_block.resize(m * 2);
+            for (size_t i = 0; i < m; ++i) {
+                sources_block[2 * i] = render_16k[i];
+                sources_block[2 * i + 1] = mic_16k[i];
+            }
+            sources.write_pcm16(pedro_audio::float_to_pcm16(sources_block));
         }
-        std::vector<float> mixed{last_render, last_render};
-        if (!wav.write_pcm16(pedro_audio::float_to_pcm16(mixed))) { std::cerr << "WAV write failed\n"; break; }
-        ++output_frames;
+        if (!wav.write_pcm16(pedro_audio::float_to_pcm16(stereo))) { std::cerr << "WAV write failed\n"; break; }
+        output_frames += n;
+        // Shared levels for the app: [0] = PC audio, [1] = microphone. Short-term RMS of
+        // exactly what is being written, so silence reads as silence. The app uses them
+        // for the record-button glow and to tell who is speaking.
+        if (levels) {
+            auto rms = [](const std::vector<float>& b) {
+                double acc = 0.0;
+                for (float v : b) acc += static_cast<double>(v) * v;
+                return b.empty() ? 0.0f : static_cast<float>(std::sqrt(acc / static_cast<double>(b.size())));
+            };
+            levels[0] = 0.5f * levels[0] + 0.5f * rms(render_block);
+            levels[1] = 0.5f * levels[1] + 0.5f * rms(mic_block);
+        }
+        std::this_thread::sleep_for(10ms);
     }
 
     running = false;
     render_queue.wake();
+    mic_queue.wake();
     render_thread.join();
+    if (mic_thread.joinable()) mic_thread.join();
     if (input_thread.joinable()) { stop_input = true; input_thread.join(); }
     wav.close();
+    if (write_sources) sources.close();
     if (stop_event) CloseHandle(stop_event);
     if (pause_event) CloseHandle(pause_event);
     if (levels) UnmapViewOfFile(levels);

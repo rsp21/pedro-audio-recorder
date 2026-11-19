@@ -24,3 +24,41 @@ Initial implementation slice: portable mixer contract and test-first scaffolding
 ## Build target
 
 The final executable targets Windows 11 x64 and will be built with the Visual Studio C++ toolchain or Windows SDK. The current Linux host does not have a Windows C++ toolchain installed, so native Windows compilation must be performed in a Windows build environment before endpoint deployment.
+
+## The app
+
+`build\pedro-audio-recorder.exe` is one window: the recorder controls on top, and the live transcript with every past recording below. It runs in the background like the built-in Windows tools:
+
+- **Ctrl+Shift+Space** shows and hides it (you can change the shortcut in **Settings**).
+- It never appears in the taskbar, Alt+Tab or Task View. Closing or minimising only hides it.
+- It starts with Windows, hidden (**Settings → Start with Windows**). **Settings → Quit** closes it completely.
+- The page icon on the left collapses it to the compact recorder card and expands it again.
+- Keys while it is open: **Space** records, pauses and resumes. **S** stops and saves. **Esc** hides the window.
+- Command line: `--background` starts it hidden, and `--quit` closes the running copy (`build_gui.bat` uses this before rebuilding).
+
+Build everything with `build_gui.bat`. It builds the C++ capture core, copies the transcription worker, and builds the WPF app (`app/`, .NET 9) into `build\`.
+
+## Live transcript: Windows Live Captions (default)
+
+The transcript comes from **Windows 11 Live Captions**, the same on-device speech engine and the same text, with the same speed. Windows has no public API for that engine, so the app starts `LiveCaptions.exe` when needed and reads its caption text through UI Automation (the `CaptionsTextBlock` element) every 50 ms. No extra model, Python or internet connection is involved.
+
+- Each paragraph Live Captions finishes is saved to the transcript. The paragraph in progress is shown live as it changes.
+- **Microphone vs PC audio:** Live Captions mixes both sources. The recorder core publishes the level of each source every 10 ms, and each sentence gets the label of the source that was louder while its words appeared. This needs **Settings → Record my microphone** in this app. For your own voice to be captioned at all, also turn on **Include microphone audio** in Live Captions' own settings (gear icon → Preferences).
+- Captions follow the Live Captions language (`HKCU\Software\Microsoft\LiveCaptions\UI`, value `CaptionLanguage`).
+- Under **Settings → Live transcript** you can switch to **Whisper on this PC's GPU** instead. It is slower, but it labels each source exactly from its own audio channel (see below).
+
+## Recording and Whisper transcript
+
+Each recording mixes the system audio (WASAPI loopback) with your microphone (the Poly BT700 headset mic when it is connected, otherwise the default recording device) into `<name>.wav`. The output is timed by the clock, so silence is kept at its real length. Turn the microphone off under **Settings → Record my microphone**. On the command line, the core takes `--no-mic`.
+
+With the Whisper engine, the core also writes `<name>.sources.wav` while recording: 16 kHz, with PC audio on the left channel and the microphone on the right. `live_transcriber.py` transcribes each channel separately with [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (large-v3 on the GPU, small on the CPU). Every line in the transcript is labelled **Microphone** or **PC audio**. Text appears about 1–2 seconds behind the audio. The sources file is deleted once the transcript is finished.
+
+- **Python:** uses `%USERPROFILE%\RSP-Transcript\.venv` (faster-whisper with CUDA, created by that project's `setup.ps1`). To use a different interpreter, set the `RSP_PYTHON` environment variable or the `PythonPath` value under `HKCU\Software\RSP\AudioRecorder`.
+- **Files:** each recording gets `<name>.transcript.jsonl` (the saved transcript, one line per segment, with its source) next to its `.wav` in `Music\Audio Recorder`. While it is recording there is also a temporary `<name>.live.json`. The format is described at the top of `transcriber/live_transcriber.py`.
+- **Transcript view:** recordings are grouped by day, with search across all of them. **Copy** and **Export** produce text like `[00:04] Microphone: …`. There are also **Play** and **Show in folder**.
+- **Options:** `RSP_WHISPER_MODEL` (for example `small`) and `RSP_WHISPER_LANGUAGE` (for example `en` or `es`). Without a language setting, the language is detected once there are about 4 seconds of actual speech, and then kept. Until then, words show only as the gray live line and nothing is saved.
+- **Logs:** `%LOCALAPPDATA%\RSP-Audio-Recorder\transcriber.log` and `app.log`. Set `RSP_TRANSCRIBER_DEBUG=1` to log each transcription pass.
+
+The streaming works like this, for each source: about once a second, the audio after the last committed word is transcribed again. A word is committed once two passes in a row agree on it. Words that are not committed yet are shown as the gray live line.
+
+If you use speakers instead of a headset, the microphone also picks up the PC audio. Those lines then appear twice, once labelled Microphone and once labelled PC audio.

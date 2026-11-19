@@ -22,12 +22,9 @@ if(WIN32)
     add_executable(pedro-audio-recorder-core
         src/main_windows.cpp
     )
-    add_executable(pedro-audio-recorder WIN32
-        src/recorder_gui.cpp
-        src/recorder_gui.rc
-    )
     target_link_libraries(pedro-audio-recorder-core PRIVATE audio_core ole32 avrt mmdevapi)
-    target_link_libraries(pedro-audio-recorder PRIVATE ole32 gdiplus dwmapi shell32 comctl32 advapi32)
     target_compile_definitions(pedro-audio-recorder-core PRIVATE UNICODE _UNICODE NOMINMAX)
-    target_compile_definitions(pedro-audio-recorder PRIVATE UNICODE _UNICODE NOMINMAX)
 endif()
+
+# The app itself (recorder + live transcript) is the WPF project in app/;
+# build it with: dotnet build app/RSPAudioRecorder.csproj -c Release -o build

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Same exe name as the earlier recorder, so the Start-with-Windows entry keeps working. -->
+    <AssemblyName>pedro-audio-recorder</AssemblyName>
+    <RootNamespace>RSPAudioRecorder</RootNamespace>
+    <ApplicationIcon>..\assets\rsp-audio-recorder.ico</ApplicationIcon>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Product>RSP Audio Recorder</Product>
+  </PropertyGroup>
+</Project>

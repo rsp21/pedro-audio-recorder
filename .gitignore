@@ -28,3 +28,8 @@ Thumbs.db
 
 # Historical source backups
 *.before-*
+
+# App build output
+app/bin/
+app/obj/
+__pycache__/
