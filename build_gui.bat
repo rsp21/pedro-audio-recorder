@@ -10,3 +10,7 @@ rc /nologo /fo build\recorder_gui.res src\recorder_gui.rc
 rem The GUI runs in the background; close it so the exe can be replaced.
 if exist build\pedro-audio-recorder.exe start "" /wait build\pedro-audio-recorder.exe --quit
 link /nologo /SUBSYSTEM:WINDOWS build\recorder_gui.obj build\recorder_gui.res ole32.lib user32.lib gdi32.lib shell32.lib gdiplus.lib dwmapi.lib comctl32.lib advapi32.lib /OUT:build\pedro-audio-recorder.exe
+rem Live transcript: Python worker next to the exe, transcript viewer in build\viewer.
+copy /y transcriber\live_transcriber.py build\live_transcriber.py >nul
+taskkill /im RSPTranscripts.exe >nul 2>&1
+dotnet build viewer\RSPTranscripts.csproj -c Release -o build\viewer -nologo -v q

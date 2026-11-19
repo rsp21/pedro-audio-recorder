@@ -65,7 +65,7 @@ const Color kSaved(255, 22, 163, 74);
 }  // namespace ui
 
 enum class State { Idle, Recording, Paused };
-enum Hit { HitNone, HitMin, HitMax, HitClose, HitPlay, HitMain, HitStop, HitGear };
+enum Hit { HitNone, HitMin, HitMax, HitClose, HitPlay, HitMain, HitStop, HitGear, HitTranscript };
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -80,6 +80,8 @@ static bool g_tracking_mouse = false;
 
 static std::wstring g_filename;           // empty = timestamped name
 static bool g_open_after_save = true;
+static bool g_record_mic = true;          // mix the microphone into the recording
+static bool g_live_transcript = true;     // run the live transcriber + open the viewer while recording
 static std::wstring g_output;             // file being recorded
 static std::wstring g_last_saved;         // most recent finished file
 static std::wstring g_message = L"Ready to record";
@@ -182,6 +184,73 @@ static std::wstring core_path() {
     return s.substr(0, s.find_last_of(L"\\/") + 1) + L"pedro-audio-recorder-core.exe";
 }
 
+// ---------------------------------------------------------------------------
+// Live transcript: Python worker (faster-whisper) + RSP Transcripts viewer
+// ---------------------------------------------------------------------------
+static std::wstring exe_dir() {
+    wchar_t p[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, p, MAX_PATH);
+    std::wstring s(p);
+    return s.substr(0, s.find_last_of(L"\\/") + 1);
+}
+
+static bool file_exists(const std::wstring& p) {
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Python with faster-whisper: RSP_PYTHON, else HKCU\Software\RSP\AudioRecorder PythonPath,
+// else the RSP-Transcript virtual environment.
+static std::wstring python_path() {
+    wchar_t b[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"RSP_PYTHON", b, MAX_PATH) && file_exists(b)) return b;
+    DWORD size = sizeof(b);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\RSP\\AudioRecorder", L"PythonPath", RRF_RT_REG_SZ, nullptr, b, &size) == ERROR_SUCCESS &&
+        file_exists(b))
+        return b;
+    wchar_t profile[MAX_PATH]{};
+    GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+    std::wstring venv = std::wstring(profile) + L"\\RSP-Transcript\\.venv\\Scripts\\python.exe";
+    return file_exists(venv) ? venv : L"";
+}
+
+static std::wstring transcriber_script() {
+    std::wstring a = exe_dir() + L"live_transcriber.py";
+    if (file_exists(a)) return a;
+    std::wstring b = exe_dir() + L"..\\transcriber\\live_transcriber.py";
+    return file_exists(b) ? b : L"";
+}
+
+static bool launch(const std::wstring& cmdline, DWORD flags) {
+    std::vector<wchar_t> v(cmdline.begin(), cmdline.end());
+    v.push_back(0);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, v.data(), nullptr, nullptr, FALSE, flags, nullptr, nullptr, &si, &pi)) return false;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+// The worker follows the WAV as it grows and exits on its own once the stop
+// event is set (or this process goes away).
+static bool start_transcriber(const std::wstring& wav, const std::wstring& stop_event) {
+    std::wstring py = python_path(), script = transcriber_script();
+    if (py.empty() || script.empty()) return false;
+    std::wstring cmd = L"\"" + py + L"\" -I \"" + script + L"\" --wav \"" + wav + L"\" --stop-event \"" + stop_event +
+                       L"\" --parent-pid " + std::to_wstring(GetCurrentProcessId());
+    return launch(cmd, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+}
+
+// follow = a recording just started: open without taking focus and track the live transcript.
+static void open_viewer(bool follow) {
+    std::wstring viewer = exe_dir() + L"viewer\\RSPTranscripts.exe";
+    if (!file_exists(viewer)) return;
+    if (!follow) AllowSetForegroundWindow(ASFW_ANY);
+    launch(L"\"" + viewer + L"\"" + (follow ? L" --follow" : L""), 0);
+}
+
 static std::wstring default_filename() {
     SYSTEMTIME now{};
     GetLocalTime(&now);
@@ -260,7 +329,8 @@ static void start_capture() {
     g_levels[0] = g_levels[1] = 0;
 
     std::wstring cmd = L"\"" + core_path() + L"\" \"" + out + L"\" --stop-event \"" + sn +
-                       L"\" --pause-event \"" + pn + L"\" --control-id \"" + id + L"\"";
+                       L"\" --pause-event \"" + pn + L"\" --control-id \"" + id + L"\"" +
+                       (g_record_mic ? L"" : L" --no-mic");
     std::vector<wchar_t> v(cmd.begin(), cmd.end());
     v.push_back(0);
     STARTUPINFOW si{};
@@ -274,6 +344,10 @@ static void start_capture() {
     g_accumulated_ms = 0;
     g_segment_start = GetTickCount64();
     set_message(L"Recording", ui::kRecording);
+    if (g_live_transcript) {
+        if (start_transcriber(out, sn)) open_viewer(true);
+        else set_message(L"Recording (transcript unavailable)", ui::kRecording);
+    }
 }
 
 static void toggle_pause() {
@@ -321,7 +395,7 @@ struct Layout {
     RectF cap_min, cap_max, cap_close;
     PointF icon;  // top-left of app icon
     float cx, cy, side_offset, main_r, side_r;
-    PointF gear;
+    PointF gear, transcript;
     float gear_r;
     float status_y;
 };
@@ -345,6 +419,7 @@ static Layout layout_for(HWND w) {
     L.cy = L.title_h + (L.h - L.title_h - S(44)) / 2;
     L.gear = PointF(L.w - S(54), L.cy);
     L.gear_r = S(24);
+    L.transcript = PointF(S(54), L.cy);
     L.status_y = L.cy + L.main_r + S(30);
     return L;
 }
@@ -363,6 +438,7 @@ static Hit hit_test(HWND w, int px, int py) {
     if (in_circle(x, y, L.cx - L.side_offset, L.cy, L.side_r)) return HitPlay;
     if (in_circle(x, y, L.cx + L.side_offset, L.cy, L.side_r)) return HitStop;
     if (in_circle(x, y, L.gear.X, L.gear.Y, L.gear_r)) return HitGear;
+    if (in_circle(x, y, L.transcript.X, L.transcript.Y, L.gear_r)) return HitTranscript;
     return HitNone;
 }
 
@@ -436,6 +512,21 @@ static void draw_gear(Graphics& g, const Color& c, REAL cx, REAL cy, REAL R) {
     g.DrawPolygon(&p, pts.data(), static_cast<INT>(pts.size()));
     REAL hub = R * 0.32f;
     g.DrawEllipse(&p, cx - hub, cy - hub, hub * 2, hub * 2);
+}
+
+// A page with lines of text.
+static void draw_transcript_glyph(Graphics& g, const Color& c, REAL cx, REAL cy, REAL R) {
+    REAL w = R * 1.5f, h = R * 1.85f;
+    Pen p(c, S(2.3f));
+    p.SetLineJoin(LineJoinRound);
+    p.SetLineCap(LineCapRound, LineCapRound, DashCapRound);
+    GraphicsPath page;
+    add_round_rect(page, cx - w / 2, cy - h / 2, w, h, S(4));
+    g.DrawPath(&p, &page);
+    REAL x0 = cx - w / 2 + S(6), x1 = cx + w / 2 - S(6);
+    g.DrawLine(&p, x0, cy - h * 0.2f, x1, cy - h * 0.2f);
+    g.DrawLine(&p, x0, cy + h * 0.02f, x1, cy + h * 0.02f);
+    g.DrawLine(&p, x0, cy + h * 0.24f, x0 + (x1 - x0) * 0.55f, cy + h * 0.24f);
 }
 
 static void draw_app_icon(Graphics& g, REAL x, REAL y, REAL size) {
@@ -608,6 +699,11 @@ static void paint(HWND w, HDC hdc) {
             fill_circle(g, g_pressed == HitGear ? ui::kSoftDown : ui::kCaptionHover, L.gear.X, L.gear.Y, L.gear_r);
         draw_gear(g, ui::kGlyph, L.gear.X, L.gear.Y, S(15));
 
+        // Transcripts (mirrors the gear on the left).
+        if (g_hover == HitTranscript)
+            fill_circle(g, g_pressed == HitTranscript ? ui::kSoftDown : ui::kCaptionHover, L.transcript.X, L.transcript.Y, L.gear_r);
+        draw_transcript_glyph(g, ui::kGlyph, L.transcript.X, L.transcript.Y, S(15));
+
         draw_status(g, L);
     }
     BitBlt(hdc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
@@ -620,7 +716,7 @@ static void paint(HWND w, HDC hdc) {
 // Settings window
 // ---------------------------------------------------------------------------
 enum { IdName = 101, IdOpenAfter = 102, IdFolder = 103, IdHint = 104, IdHotkey = 105, IdStartup = 106,
-       IdQuit = 107, IdHotkeyHint = 108 };
+       IdQuit = 107, IdHotkeyHint = 108, IdTranscribe = 109, IdMic = 110 };
 static HFONT g_settings_font{};
 static HBRUSH g_white_brush{};
 
@@ -654,6 +750,10 @@ static LRESULT CALLBACK settings_proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             g_hotkey = hk;
             reg_write_dword(L"Hotkey", hk);
             g_open_after_save = SendDlgItemMessageW(w, IdOpenAfter, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            g_live_transcript = SendDlgItemMessageW(w, IdTranscribe, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            g_record_mic = SendDlgItemMessageW(w, IdMic, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            reg_write_dword(L"RecordMic", g_record_mic ? 1 : 0);
+            reg_write_dword(L"LiveTranscript", g_live_transcript ? 1 : 0);
             set_startup(SendDlgItemMessageW(w, IdStartup, BM_GETCHECK, 0, 0) == BST_CHECKED);
             close_settings();
             return 0;
@@ -719,7 +819,7 @@ static void open_settings() {
     g_settings_font = CreateFontIndirectW(&ncm.lfMessageFont);
 
     const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_DLGMODALFRAME;
-    RECT r{0, 0, px(420), px(338)};
+    RECT r{0, 0, px(420), px(394)};
     AdjustWindowRectExForDpi(&r, style, FALSE, ex, g_dpi);
     int ww = r.right - r.left, wh = r.bottom - r.top;
     RECT mr;
@@ -745,20 +845,26 @@ static void open_settings() {
     HWND check = make(0, L"BUTTON", L"Open audio file after saving", WS_TABSTOP | BS_AUTOCHECKBOX,
                       24, 104, 372, 24, IdOpenAfter);
     SendMessageW(check, BM_SETCHECK, g_open_after_save ? BST_CHECKED : BST_UNCHECKED, 0);
+    HWND live = make(0, L"BUTTON", L"Live transcript (shows the transcript window while recording)",
+                     WS_TABSTOP | BS_AUTOCHECKBOX, 24, 132, 372, 24, IdTranscribe);
+    SendMessageW(live, BM_SETCHECK, g_live_transcript ? BST_CHECKED : BST_UNCHECKED, 0);
+    HWND mic = make(0, L"BUTTON", L"Record my microphone (applies from the next recording)",
+                    WS_TABSTOP | BS_AUTOCHECKBOX, 24, 160, 372, 24, IdMic);
+    SendMessageW(mic, BM_SETCHECK, g_record_mic ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    make(0, L"STATIC", L"Show / hide shortcut", 0, 24, 144, 372, 20, 0);
-    HWND hot = make(WS_EX_CLIENTEDGE, HOTKEY_CLASSW, L"", WS_TABSTOP, 24, 166, 220, 28, IdHotkey);
+    make(0, L"STATIC", L"Show / hide shortcut", 0, 24, 200, 372, 20, 0);
+    HWND hot = make(WS_EX_CLIENTEDGE, HOTKEY_CLASSW, L"", WS_TABSTOP, 24, 222, 220, 28, IdHotkey);
     SendMessageW(hot, HKM_SETRULES, HKCOMB_NONE | HKCOMB_S, MAKELPARAM(HOTKEYF_CONTROL | HOTKEYF_SHIFT, 0));
     SendMessageW(hot, HKM_SETHOTKEY, g_hotkey, 0);
-    make(0, L"STATIC", L"Click the box and press a new key combination.", 0, 24, 200, 372, 20, IdHotkeyHint);
+    make(0, L"STATIC", L"Click the box and press a new key combination.", 0, 24, 256, 372, 20, IdHotkeyHint);
     HWND startup = make(0, L"BUTTON", L"Start with Windows (runs in the background)", WS_TABSTOP | BS_AUTOCHECKBOX,
-                        24, 230, 372, 24, IdStartup);
+                        24, 286, 372, 24, IdStartup);
     SendMessageW(startup, BM_SETCHECK, startup_enabled() ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    make(0, L"BUTTON", L"Open folder", WS_TABSTOP, 24, 284, 96, 30, IdFolder);
-    make(0, L"BUTTON", L"Quit", WS_TABSTOP, 128, 284, 72, 30, IdQuit);
-    make(0, L"BUTTON", L"Save", WS_TABSTOP | BS_DEFPUSHBUTTON, 220, 284, 84, 30, IDOK);
-    make(0, L"BUTTON", L"Cancel", WS_TABSTOP, 312, 284, 84, 30, IDCANCEL);
+    make(0, L"BUTTON", L"Open folder", WS_TABSTOP, 24, 340, 96, 30, IdFolder);
+    make(0, L"BUTTON", L"Quit", WS_TABSTOP, 128, 340, 72, 30, IdQuit);
+    make(0, L"BUTTON", L"Save", WS_TABSTOP | BS_DEFPUSHBUTTON, 220, 340, 84, 30, IDOK);
+    make(0, L"BUTTON", L"Cancel", WS_TABSTOP, 312, 340, 84, 30, IDCANCEL);
 
     EnableWindow(g_main, FALSE);
     ShowWindow(g_settings_win, SW_SHOW);
@@ -779,6 +885,7 @@ static void activate(Hit h) {
     case HitMain: main_action(); break;
     case HitStop: stop_capture(); break;
     case HitGear: open_settings(); break;
+    case HitTranscript: open_viewer(false); break;
     default: break;
     }
     InvalidateRect(g_main, nullptr, FALSE);
@@ -1019,6 +1126,8 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, PWSTR cmdline, int) {
 
     // Global show/hide shortcut (default Ctrl+Shift+Space, changeable in Settings).
     g_hotkey = static_cast<WORD>(reg_read_dword(L"Hotkey", kDefaultHotkey));
+    g_live_transcript = reg_read_dword(L"LiveTranscript", 1) != 0;
+    g_record_mic = reg_read_dword(L"RecordMic", 1) != 0;
     if (!register_hotkey(win, g_hotkey)) mark("hotkey_fail\n");
 
     // First run: register to start with Windows (can be turned off in Settings).

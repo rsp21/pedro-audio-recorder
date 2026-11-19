@@ -28,3 +28,8 @@ Thumbs.db
 
 # Historical source backups
 *.before-*
+
+# Transcript viewer build output
+viewer/bin/
+viewer/obj/
+__pycache__/
