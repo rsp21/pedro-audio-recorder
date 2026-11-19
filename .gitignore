@@ -29,7 +29,7 @@ Thumbs.db
 # Historical source backups
 *.before-*
 
-# Transcript viewer build output
-viewer/bin/
-viewer/obj/
+# App build output
+app/bin/
+app/obj/
 __pycache__/

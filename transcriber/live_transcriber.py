@@ -1,9 +1,13 @@
 """RSP Audio Recorder - live transcription worker.
 
-Follows the WAV file that pedro-audio-recorder-core.exe is writing and
-transcribes it with faster-whisper while the recording is still running.
+Follows the audio that pedro-audio-recorder-core.exe is writing and transcribes
+it with faster-whisper while the recording is still running. The core writes
+<name>.sources.wav (16 kHz, left = PC audio, right = microphone) next to the
+mixed <name>.wav; each channel is transcribed separately so every line is
+labelled with where it came from. (Without a sources file the mixed WAV is
+used and lines carry no source.)
 
-Started by the recorder GUI for every recording:
+Started by the recorder app for every recording:
 
     python live_transcriber.py --wav "C:\\...\\audio-20261119-101500.wav"
                                --stop-event "Local\\RSPAudioStop_1234"
@@ -15,18 +19,17 @@ Output, next to the WAV (this is the transcript history the viewer reads):
       {"type": "meta", "audio": str, "started": iso8601}
       {"type": "model", "model": str, "device": str}
       {"type": "language", "language": "en", "probability": 0.98}
-      {"type": "segment", "start": 12.3, "end": 15.9, "text": "..."}
+      {"type": "segment", "start": 12.3, "end": 15.9, "text": "...", "source": "pc" | "mic" | null}
       {"type": "done", "duration": 431.2}
       {"type": "error", "message": "..."}
 
   <name>.live.json          rewritten ~once per second while recording, deleted at the end
       {"status": "loading" | "listening" | "finishing" | "error",
-       "message": str, "partial": str, "position": float, "updated": epoch}
+       "message": str, "partials": {"pc": str, "mic": str}, "position": float, "updated": epoch}
 
-Streaming approach: audio after the last committed point is re-transcribed
-about once a second. Whisper segments that are clearly finished (followed by
-more speech, or by silence) are committed to the transcript; the unfinished
-tail is published as the live "partial" line.
+Streaming approach (per source): audio after the last committed point is
+re-transcribed about once a second; a word is committed once two consecutive
+passes agree on it, and the uncommitted tail is published as the live line.
 """
 
 from __future__ import annotations
@@ -173,20 +176,27 @@ class WavTail:
         self.hist = np.zeros(len(self.taps) - 1, dtype=np.float32)
 
     def read(self) -> np.ndarray:
-        """Return newly written audio as 16 kHz mono float32 (possibly empty)."""
+        """Newly written audio at 16 kHz, shape (samples, channels); possibly empty.
+
+        16 kHz files (the sources file) are returned channel by channel; anything
+        else (the mixed 48 kHz WAV) is mixed to mono and resampled: shape (n, 1).
+        """
+        empty = np.zeros((0, self.channels if self.rate == SR else 1), dtype=np.float32)
         if not self._open():
-            return np.zeros(0, dtype=np.float32)
+            return np.zeros((0, 1), dtype=np.float32)
         self.f.seek(self.data_offset + self.pos)
         new = self.f.read()
         if not new:
-            return np.zeros(0, dtype=np.float32)
+            return empty
         self.pos += len(new)
         raw = self.carry + new
         frame = 2 * self.channels
         usable = len(raw) // frame * frame
         self.carry = raw[usable:]
-        pcm = np.frombuffer(raw[:usable], dtype=np.int16).reshape(-1, self.channels)
-        mono = pcm.mean(axis=1).astype(np.float32) / 32768.0
+        pcm = np.frombuffer(raw[:usable], dtype=np.int16).reshape(-1, self.channels).astype(np.float32) / 32768.0
+        if self.rate == SR:
+            return pcm
+        mono = pcm.mean(axis=1)
         # Filter with history so chunk boundaries are seamless.
         x = np.concatenate([self.hist, mono])
         y = np.convolve(x, self.taps, mode="valid")
@@ -199,7 +209,7 @@ class WavTail:
             idx = np.arange(self.phase, len(y) - 1, self.step)
             out = np.interp(idx, np.arange(len(y)), y).astype(np.float32)
             self.phase = (idx[-1] + self.step - len(y)) if len(idx) else self.phase - len(y)
-        return out.astype(np.float32)
+        return out.astype(np.float32).reshape(-1, 1)
 
     def close(self) -> None:
         if self.f:
@@ -218,7 +228,7 @@ class Output:
         self.live = stem + ".live.json"
         self.status = "loading"
         self.message = "Loading speech model…"
-        self.partial = ""
+        self.partials: dict[str, str] = {}
         self.position = 0.0
 
     def append(self, **obj) -> None:
@@ -228,7 +238,7 @@ class Output:
     def publish(self, **changes) -> None:
         for k, v in changes.items():
             setattr(self, k, v)
-        data = {"status": self.status, "message": self.message, "partial": self.partial,
+        data = {"status": self.status, "message": self.message, "partials": self.partials,
                 "position": round(self.position, 2), "updated": time.time()}
         tmp = self.live + ".tmp"
         try:
@@ -237,6 +247,9 @@ class Output:
             os.replace(tmp, self.live)
         except OSError as exc:  # viewer may be reading it; next tick retries
             log(f"live.json write skipped: {exc}")
+
+    def set_partial(self, source: str | None, text: str) -> None:
+        self.partials[source or "mixed"] = text
 
     def finish(self) -> None:
         try:
@@ -290,13 +303,22 @@ def join(words: list[W]) -> str:
     return "".join(w.text for w in words).strip()
 
 
-class Streamer:
-    """LocalAgreement streaming: words are committed once two consecutive passes agree."""
+class Language:
+    """Language shared by all sources: locked once, from whichever source speaks first."""
 
-    def __init__(self, model, out: Output, language: str | None):
+    def __init__(self, value: str | None):
+        self.value = value
+
+
+class Streamer:
+    """LocalAgreement streaming of one audio source: words are committed once two
+    consecutive passes agree."""
+
+    def __init__(self, model, out: Output, lang: Language, source: str | None):
         self.model = model
         self.out = out
-        self.language = language
+        self.lang = lang
+        self.source = source
         self.buf = np.zeros(0, dtype=np.float32)  # audio window being re-transcribed
         self.base = 0.0                           # session time of buf[0]
         self.unprocessed = 0.0                    # audio added since last pass
@@ -304,6 +326,8 @@ class Streamer:
         self.prev: list[W] = []                   # previous pass's uncommitted words
         self.line: list[W] = []                   # committed words not yet written as a segment
         self.tail: list[str] = []                 # last few committed words (normalised)
+        self.history: list[str] = []              # last ~40 committed words (normalised)
+        self.empty_passes = 0                     # consecutive passes that heard nothing
         self.context = ""                         # text already cut out of the window, used as prompt
 
     @property
@@ -326,7 +350,7 @@ class Streamer:
         translate. So: collect VAD speech first, require a clear winner, and only
         settle for the best guess after plenty of speech.
         """
-        if self.language or len(self.buf) < SR * 2:
+        if self.lang.value or len(self.buf) < SR * 2:
             return
         try:
             from faster_whisper.vad import VadOptions, get_speech_timestamps
@@ -341,9 +365,9 @@ class Streamer:
             return
         enough = len(speech) >= SR * LANG_MAX_SPEECH
         if DEBUG:
-            log(f"language guess {lang} ({prob:.2f}) on {len(speech) / SR:.1f}s of speech")
+            log(f"[{self.source}] language guess {lang} ({prob:.2f}) on {len(speech) / SR:.1f}s of speech")
         if prob >= 0.8 or enough:
-            self.language = lang
+            self.lang.value = lang
             self.out.append(type="language", language=lang, probability=round(float(prob), 3))
             log(f"language locked: {lang} ({prob:.2f}) after {len(speech) / SR:.1f}s of speech")
 
@@ -353,15 +377,16 @@ class Streamer:
         text = join(self.line)
         if text:
             self.out.append(type="segment", start=round(self.line[0].start, 2),
-                            end=round(self.line[-1].end, 2), text=text)
+                            end=round(self.line[-1].end, 2), text=text, source=self.source)
         self.line = []
 
     def _uncommitted(self, words: list[W]) -> list[W]:
         """Words of this pass that come after what is already committed.
 
-        self.wc lists the committed words whose audio is still in the window. Word
-        timings drift between passes, so they are matched by text, allowing for
-        up to two leading fragment words (the tail of the sentence before the cut).
+        self.wc lists the committed words whose audio may still be in the window
+        (after a cut, possibly only the end of that list is still audible). Word
+        timings drift between passes, so they are matched by text, allowing up to
+        two leading fragment words.
         """
         wc = self.wc
         if not wc:
@@ -369,25 +394,57 @@ class Streamer:
             if words and self.tail and _norm(words[0].text) == self.tail[-1] and words[0].start < self.base + 1.0:
                 return words[1:]
             return words
-        best_j, best_m = 0, -1
-        for j in range(0, 3):
+
+        def run(j: int, k: int) -> int:
             m = 0
-            while m < len(wc) and j + m < len(words) and _norm(words[j + m].text) == wc[m]:
+            while k + m < len(wc) and j + m < len(words) and _norm(words[j + m].text) == wc[k + m]:
                 m += 1
-            if m > best_m:
-                best_j, best_m = j, m
-        if best_m <= 0:
-            best_j = 0  # whisper re-worded the committed part; assume the same word count
-        return words[best_j + len(wc):]
+            return m
+
+        # Best: some suffix wc[k:] appears in full at the start of this pass.
+        best = None
+        for k in range(len(wc)):
+            for j in range(3):
+                m = run(j, k)
+                if m == len(wc) - k and m > 0 and (best is None or m > best[2]):
+                    best = (j, k, m)
+        if best:
+            return words[best[0] + best[2]:]
+        # Partial agreement (whisper re-worded a committed word): skip the same count.
+        j, m = max(((j, run(j, 0)) for j in range(3)), key=lambda t: t[1])
+        if m > 0:
+            return words[j + len(wc):]
+        # None of the committed words were heard again (whisper skipped the clipped
+        # tail before the cut), so everything in this pass is new. Timing is no help
+        # here: whisper places the first word at the very start of the window.
+        return words
 
     def _commit(self, words: list[W]) -> None:
         for w in words:
             self.line.append(w)
             self.wc.append(_norm(w.text))
+            self.history = (self.history + [_norm(w.text)])[-40:]
             self.tail = (self.tail + [_norm(w.text)])[-3:]
             # Write a segment at each sentence end (or every ~25 words).
             if w.text.rstrip().endswith((".", "?", "!")) or len(self.line) >= 25:
                 self._flush_line()
+
+    def _drop_repeat(self, new: list[W]) -> list[W]:
+        """Drop a prefix of `new` that repeats the most recent committed words.
+
+        With only a scrap of the last sentence left in the window, whisper tends to
+        echo that sentence back from its prompt. A run of 3+ words identical to the
+        end of the transcript (or all of `new`, if shorter) is that echo.
+        """
+        hist = self.history
+        for k in range(min(len(new), len(hist)), 0, -1):
+            if k < 3 and k != len(new):
+                break
+            if [_norm(w.text) for w in new[:k]] == hist[-k:] and (k >= 3 or k == len(new) >= 2):
+                if DEBUG:
+                    log(f"[{self.source}] dropped repeated words: {join(new[:k])}")
+                return new[k:]
+        return new
 
     def _remember(self, words: list[W]) -> None:
         """Words leaving the window become prompt context. (Text that is still in the
@@ -407,13 +464,13 @@ class Streamer:
         self.unprocessed = 0.0
         window = len(self.buf) / SR
         if window < 0.4:
-            self.out.publish(partial="", position=self.duration)
+            self.out.set_partial(self.source, "")
             return
 
         self._detect_language()
         segments, _ = self.model.transcribe(
             self.buf,
-            language=self.language,
+            language=self.lang.value,
             beam_size=5 if final else 1,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 400},
@@ -423,10 +480,10 @@ class Streamer:
             temperature=0.0,
         )
         words = words_from(segments, self.base, window)
-        new = self._uncommitted(words)
+        new = self._drop_repeat(self._uncommitted(words))
         first_new = len(words) - len(new)
         if DEBUG:
-            log(f"pass base={self.base:.2f} win={window:.2f} wc={self.wc} "
+            log(f"[{self.source}] pass base={self.base:.2f} win={window:.2f} wc={self.wc} "
                 f"words={[w.text.strip() for w in words]} new={[w.text.strip() for w in new]} "
                 f"prev={[w.text.strip() for w in self.prev]}")
 
@@ -436,27 +493,38 @@ class Streamer:
             self._remember(words)
             self.prev, self.wc = [], []
             self._trim(self.duration)
-            self.out.publish(partial="", position=self.duration)
+            self.out.set_partial(self.source, "")
             return
 
         # LocalAgreement: commit the longest common prefix with the previous pass.
+        if not words:
+            # An empty pass is either silence or a one-off miss (whisper sometimes
+            # filters out a whole segment). Keep the pending words; only after two
+            # empty passes in a row treat it as silence: keep what was last heard,
+            # then drop all but a short tail of audio.
+            self.empty_passes += 1
+            if self.empty_passes >= 2 and window > 3.0:
+                if self.prev and self.lang.value is not None:
+                    self._commit(self.prev)
+                self._flush_line()
+                self._remember(self.prev)
+                self._trim(self.duration - 1.0)
+                self.wc, self.prev = [], []
+            self.out.set_partial(self.source, join(self.line + self.prev))
+            return
+        self.empty_passes = 0
+
         agreed = 0
         while (agreed < len(new) and agreed < len(self.prev)
                and _norm(new[agreed].text) == _norm(self.prev[agreed].text)):
             agreed += 1
-        if self.language is None:
+        if self.lang.value is None:
             agreed = 0  # show it live, but commit nothing until the language is known
         self._commit(new[:agreed])
         self.prev = new[agreed:]
         committed_upto = first_new + agreed  # words[:committed_upto] are committed
 
-        if not words:
-            # Nothing but silence/noise: drop all but a short tail.
-            if window > 3.0:
-                self._flush_line()
-                self._trim(self.duration - 1.0)
-                self.wc, self.prev = [], []
-        elif window > TRIM_AT:
+        if window > TRIM_AT:
             # Keep the window short: cut after the last committed sentence, or after
             # the last committed word when one sentence runs too long. Cut in the gap
             # before the next word, leaving ~0.6 s of lead-in (whisper tends to drop
@@ -471,17 +539,19 @@ class Streamer:
                     if words[i].text.rstrip().endswith((".", "?", "!"))]
             if ends:
                 i = ends[-1]
+                cut = cut_after(i)
                 self._remember(words[:i + 1])
-                self._trim(cut_after(i))
-                self.wc = [_norm(w.text) for w in words[i + 1:committed_upto]]
+                self._trim(cut)
+                # Committed words that (partly) remain after the cut, lead-in included.
+                self.wc = [_norm(w.text) for w in words[:committed_upto] if w.end > cut]
             elif window > HARD_LIMIT and committed_upto > 0:
                 self._flush_line()
+                cut = cut_after(committed_upto - 1)
                 self._remember(words[:committed_upto])
-                self._trim(cut_after(committed_upto - 1))
-                self.wc = []
+                self._trim(cut)
+                self.wc = [_norm(w.text) for w in words[:committed_upto] if w.end > cut]
 
-        partial = join(self.line + self.prev)
-        self.out.publish(partial=partial, position=self.duration)
+        self.out.set_partial(self.source, join(self.line + self.prev))
 
 
 # --------------------------------------------------------------------------- #
@@ -534,46 +604,73 @@ def main() -> int:
         if args.language:
             out.append(type="language", language=args.language, probability=1.0)
 
-        tail = WavTail(args.wav)
-        streamer = Streamer(model, out, args.language or None)
+        # Prefer the per-source file; the core creates it right after the main WAV.
+        sources = os.path.splitext(args.wav)[0] + ".sources.wav"
+        for _ in range(30):
+            if os.path.exists(sources):
+                break
+            time.sleep(0.1)
+        if os.path.exists(sources):
+            tail = WavTail(sources)
+            labels: list[str | None] = ["pc", "mic"]
+        else:
+            log("no sources file; transcribing the mixed recording")
+            tail = WavTail(args.wav)
+            labels = [None]
+        lang = Language(args.language or None)
+        streamers = [Streamer(model, out, lang, label) for label in labels]
         out.publish(status="listening", message="Listening")
         last_audio = time.time()
         committed_idle = True
+
+        def position() -> float:
+            return max(st.duration for st in streamers)
 
         while True:
             stopping = is_signaled(stop) or not process_alive(args.parent_pid)
             audio = tail.read()
             if len(audio):
-                streamer.add(audio)
+                for i, st in enumerate(streamers):
+                    st.add(audio[:, min(i, audio.shape[1] - 1)])
                 last_audio = time.time()
                 committed_idle = False
 
             if stopping:
-                # Core finalises the file within a moment of the stop event.
+                # Core finalises the files within a moment of the stop event.
                 out.publish(status="finishing", message="Finishing transcript")
                 time.sleep(0.6)
-                streamer.add(tail.read())
-                streamer.step(final=True)
+                audio = tail.read()
+                for i, st in enumerate(streamers):
+                    if len(audio):
+                        st.add(audio[:, min(i, audio.shape[1] - 1)])
+                    st.step(final=True)
                 break
 
             idle = time.time() - last_audio > IDLE_COMMIT
             if idle and not committed_idle:
-                streamer.step(final=True)  # paused / silent: settle everything
+                for st in streamers:
+                    st.step(final=True)  # paused: settle everything
                 committed_idle = True
-            elif streamer.due():
-                streamer.step()
             else:
-                out.publish(position=streamer.duration)
+                for st in streamers:
+                    if st.due():
+                        st.step()
+            out.publish(position=position())
             time.sleep(TICK)
 
-        out.append(type="done", duration=round(streamer.duration, 2))
+        out.append(type="done", duration=round(position(), 2))
         tail.close()
-        log(f"done duration={streamer.duration:.1f}s")
+        log(f"done duration={position():.1f}s")
+        if labels != [None]:
+            try:
+                os.remove(sources)  # only needed while transcribing
+            except OSError as exc:
+                log(f"could not remove sources file: {exc}")
         return 0
     except Exception as exc:
         log("ERROR " + traceback.format_exc())
         out.append(type="error", message=str(exc))
-        out.publish(status="error", message=str(exc), partial="")
+        out.publish(status="error", message=str(exc))
         time.sleep(2)
         return 1
     finally:

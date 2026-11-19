@@ -112,6 +112,44 @@ public:
 };
 
 constexpr uint32_t kOutputRate = 48000;
+constexpr uint32_t kSourcesRate = 16000;  // speech-recognition rate for <name>.sources.wav
+
+// 48 kHz -> 16 kHz: windowed-sinc low-pass, then keep every third sample.
+// Stateful, so consecutive blocks join seamlessly.
+class Decimate3 {
+    std::vector<float> taps_;
+    std::vector<float> history_;
+    size_t phase_ = 0;
+public:
+    Decimate3() {
+        const int half = 24;
+        const double cutoff = 0.45 / 3.0;  // of the 48 kHz sample rate (~7.2 kHz)
+        double sum = 0.0;
+        for (int n = -half; n <= half; ++n) {
+            const double x = 2.0 * cutoff * n;
+            const double sinc = n == 0 ? 1.0 : std::sin(3.14159265358979 * x) / (3.14159265358979 * x);
+            const double window = 0.54 + 0.46 * std::cos(3.14159265358979 * n / half);
+            taps_.push_back(static_cast<float>(2.0 * cutoff * sinc * window));
+            sum += taps_.back();
+        }
+        for (auto& t : taps_) t = static_cast<float>(t / sum);
+        history_.assign(taps_.size() - 1, 0.0f);
+    }
+
+    void process(const std::vector<float>& in, std::vector<float>& out) {
+        out.clear();
+        std::vector<float> x(history_);
+        x.insert(x.end(), in.begin(), in.end());
+        const size_t valid = x.size() - taps_.size() + 1;
+        for (size_t i = phase_; i < valid; i += 3) {
+            float acc = 0.0f;
+            for (size_t k = 0; k < taps_.size(); ++k) acc += x[i + k] * taps_[k];
+            out.push_back(acc);
+        }
+        phase_ = (phase_ + 3 - valid % 3) % 3;
+        history_.assign(x.end() - static_cast<std::ptrdiff_t>(taps_.size() - 1), x.end());
+    }
+};
 
 class WavWriter {
     std::ofstream file_;
@@ -382,6 +420,15 @@ int main(int argc, char** argv) {
 
     WavWriter wav;
     if (!wav.open(output, kOutputRate)) { std::cerr << "Cannot open output\n"; CoTaskMemFree(render_format); return 2; }
+    // Side file for the live transcript: left = PC audio, right = microphone, 16 kHz.
+    // Lets the transcriber label who said what without separating a mixed signal.
+    const std::string stem = output.size() > 4 && _stricmp(output.c_str() + output.size() - 4, ".wav") == 0
+                                 ? output.substr(0, output.size() - 4) : output;
+    WavWriter sources;
+    const bool write_sources = sources.open(stem + ".sources.wav", kSourcesRate);
+    if (!write_sources) std::cerr << "sources file could not be opened; continuing without it\n";
+    Decimate3 render_down, mic_down;
+    std::vector<float> render_16k, mic_16k, sources_block;
 
     SampleQueue render_queue;
     std::atomic<bool> running{true};
@@ -452,6 +499,17 @@ int main(int argc, char** argv) {
         mic_queue.take(mic_block.data(), n);
         stereo.assign(n * 2, 0.0f);
         pedro_audio::mix_to_stereo(render_block, 1, mic_block, 1, stereo);
+        if (write_sources) {
+            render_down.process(render_block, render_16k);
+            mic_down.process(mic_block, mic_16k);
+            const size_t m = std::min(render_16k.size(), mic_16k.size());
+            sources_block.resize(m * 2);
+            for (size_t i = 0; i < m; ++i) {
+                sources_block[2 * i] = render_16k[i];
+                sources_block[2 * i + 1] = mic_16k[i];
+            }
+            sources.write_pcm16(pedro_audio::float_to_pcm16(sources_block));
+        }
         if (!wav.write_pcm16(pedro_audio::float_to_pcm16(stereo))) { std::cerr << "WAV write failed\n"; break; }
         output_frames += n;
         std::this_thread::sleep_for(10ms);
@@ -464,6 +522,7 @@ int main(int argc, char** argv) {
     if (mic_thread.joinable()) mic_thread.join();
     if (input_thread.joinable()) { stop_input = true; input_thread.join(); }
     wav.close();
+    if (write_sources) sources.close();
     if (stop_event) CloseHandle(stop_event);
     if (pause_event) CloseHandle(pause_event);
     if (levels) UnmapViewOfFile(levels);

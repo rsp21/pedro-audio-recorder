@@ -5,9 +5,23 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 
-namespace RSPTranscripts;
+namespace RSPAudioRecorder;
 
-public sealed record Segment(double Start, double End, string Text);
+/// <summary>Where a line was heard: the microphone, PC audio, or (older recordings) unknown.</summary>
+public static class Sources
+{
+    public const string Mic = "mic";
+    public const string Pc = "pc";
+
+    public static string Label(string? source) => source switch
+    {
+        Mic => "Microphone",
+        Pc => "PC audio",
+        _ => "",
+    };
+}
+
+public sealed record Segment(double Start, double End, string Text, string? Source);
 
 /// <summary>
 /// One recording's transcript: &lt;name&gt;.transcript.jsonl (append-only, written by
@@ -28,7 +42,7 @@ public sealed class Session : INotifyPropertyChanged
     // Live state (from .live.json)
     public string LiveStatus { get; private set; } = "";
     public string LiveMessage { get; private set; } = "";
-    public string Partial { get; private set; } = "";
+    public Dictionary<string, string> Partials { get; private set; } = new();
     private double _position;
     private double _finalDuration;
     private long _offset;
@@ -45,11 +59,13 @@ public sealed class Session : INotifyPropertyChanged
     public bool IsLive
     {
         get => _isLive;
-        private set { if (_isLive != value) { _isLive = value; Raise(); Raise(nameof(LiveLabel)); } }
+        private set { if (_isLive != value) { _isLive = value; Raise(); } }
     }
 
+    public bool HasPartial => Partials.Values.Any(p => p.Length > 0);
+
     public double Duration => _finalDuration > 0 ? _finalDuration
-        : Math.Max(_position, Segments.Count > 0 ? Segments[^1].End : 0);
+        : Math.Max(_position, Segments.Count > 0 ? Segments.Max(s => s.End) : 0);
 
     public string DurationText => FormatTime(Duration);
     public string TimeText => Started.ToString("h:mm tt", CultureInfo.CurrentCulture);
@@ -63,7 +79,6 @@ public sealed class Session : INotifyPropertyChanged
             return d.Year == DateTime.Today.Year ? d.ToString("dddd, MMMM d") : d.ToString("MMMM d, yyyy");
         }
     }
-    public DateTime Day => Started.Date;
     public string Title => Started.ToString("dddd, MMMM d · h:mm tt", CultureInfo.CurrentCulture);
     public int WordCount => Segments.Sum(s => s.Text.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length);
 
@@ -73,25 +88,18 @@ public sealed class Session : INotifyPropertyChanged
         {
             if (Error != null && Segments.Count == 0) return "Transcription failed: " + Error;
             if (Segments.Count == 0)
-                return IsLive ? (Partial.Length > 0 ? Partial : LiveMessage.Length > 0 ? LiveMessage + "…" : "Listening…")
+            {
+                var p = string.Join(" ", Partials.Values.Where(v => v.Length > 0));
+                return IsLive ? (p.Length > 0 ? p : LiveMessage.Length > 0 ? LiveMessage + "…" : "Listening…")
                               : "No speech detected";
+            }
             var sb = new StringBuilder();
-            foreach (var s in Segments) { sb.Append(s.Text).Append(' '); if (sb.Length > 160) break; }
+            foreach (var s in Segments.OrderBy(s => s.Start)) { sb.Append(s.Text).Append(' '); if (sb.Length > 160) break; }
             return sb.ToString().Trim();
         }
     }
 
-    public string LiveLabel => IsLive ? "Live" : "";
-
-    public string FullText
-    {
-        get
-        {
-            var sb = new StringBuilder();
-            foreach (var s in Segments) sb.Append(s.Text).Append(' ');
-            return sb.ToString();
-        }
-    }
+    public string FullText => string.Join(" ", Segments.Select(s => s.Text));
 
     /// <summary>Reads anything appended since the last call. Returns true if something changed.</summary>
     public bool Refresh()
@@ -139,8 +147,10 @@ public sealed class Session : INotifyPropertyChanged
                     Language = r.GetProperty("language").GetString();
                     return true;
                 case "segment":
+                    string? source = r.TryGetProperty("source", out var src) && src.ValueKind == JsonValueKind.String
+                        ? src.GetString() : null;
                     Segments.Add(new Segment(r.GetProperty("start").GetDouble(), r.GetProperty("end").GetDouble(),
-                                             r.GetProperty("text").GetString() ?? ""));
+                                             r.GetProperty("text").GetString() ?? "", source));
                     return true;
                 case "done":
                     Done = true;
@@ -153,13 +163,15 @@ public sealed class Session : INotifyPropertyChanged
         }
         catch (JsonException) { }
         catch (KeyNotFoundException) { }
+        catch (InvalidOperationException) { }
         return false;
     }
 
     private bool RefreshLive()
     {
         bool live = false;
-        string status = "", message = "", partial = "";
+        string status = "", message = "";
+        var partials = new Dictionary<string, string>();
         if (!Done && File.Exists(LivePath))
         {
             try
@@ -169,7 +181,11 @@ public sealed class Session : INotifyPropertyChanged
                 var r = doc.RootElement;
                 status = r.GetProperty("status").GetString() ?? "";
                 message = r.GetProperty("message").GetString() ?? "";
-                partial = r.GetProperty("partial").GetString() ?? "";
+                if (r.TryGetProperty("partials", out var ps) && ps.ValueKind == JsonValueKind.Object)
+                    foreach (var p in ps.EnumerateObject())
+                        partials[p.Name] = p.Value.GetString() ?? "";
+                else if (r.TryGetProperty("partial", out var single))
+                    partials["mixed"] = single.GetString() ?? "";
                 _position = r.GetProperty("position").GetDouble();
                 double updated = r.GetProperty("updated").GetDouble();
                 // A worker that stopped updating (crashed) is no longer live.
@@ -179,12 +195,15 @@ public sealed class Session : INotifyPropertyChanged
             catch (UnauthorizedAccessException) { return false; }
             catch (JsonException) { return false; }
             catch (KeyNotFoundException) { return false; }
+            catch (InvalidOperationException) { return false; }
         }
-        bool changed = live != IsLive || status != LiveStatus || partial != Partial || message != LiveMessage;
+        if (!live) partials.Clear();
+        bool changed = live != IsLive || status != LiveStatus || message != LiveMessage
+                       || !partials.OrderBy(k => k.Key).SequenceEqual(Partials.OrderBy(k => k.Key));
         IsLive = live;
         LiveStatus = status;
         LiveMessage = message;
-        Partial = live ? partial : "";
+        Partials = partials;
         return changed;
     }
 
@@ -212,15 +231,11 @@ public sealed class Session : INotifyPropertyChanged
 
 public static class TranscriptStore
 {
-    /// <summary>Where the recorder saves audio (RSP_TRANSCRIPT_DIR overrides it, for testing).</summary>
-    public static string Folder =>
-        Environment.GetEnvironmentVariable("RSP_TRANSCRIPT_DIR") is { Length: > 0 } dir ? dir
-        : Path.Combine(Environment.GetEnvironmentVariable("USERPROFILE") ?? "", "Music", "Audio Recorder");
-
     public static IEnumerable<string> Scan()
     {
-        if (!Directory.Exists(Folder)) return Array.Empty<string>();
-        try { return Directory.EnumerateFiles(Folder, "*.transcript.jsonl").ToList(); }
+        var folder = AppSettings.OutputFolder;
+        if (!Directory.Exists(folder)) return Array.Empty<string>();
+        try { return Directory.EnumerateFiles(folder, "*.transcript.jsonl").ToList(); }
         catch (IOException) { return Array.Empty<string>(); }
     }
 }
